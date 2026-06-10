@@ -1,0 +1,2292 @@
+controller
+import { Controller } from 'egg';
+
+export default class YeDefectNoticeController extends Controller {
+  async lotBasicInfo() {
+    const { ctx } = this;
+    const lotId = String(ctx.query.lotId || '').trim();
+    ctx.body = this.ok(await ctx.service.yeDefectNotice.getLotBasicBundle(lotId));
+  }
+
+  async dnOptions() {
+    const { ctx } = this;
+    ctx.body = this.ok(await ctx.service.yeDefectNotice.getDnOptions({
+      keyword: String(ctx.query.keyword || '').trim(),
+      lotId: String(ctx.query.lotId || '').trim(),
+    }));
+  }
+
+  async dnDetail() {
+    const { ctx } = this;
+    ctx.body = this.ok(await ctx.service.yeDefectNotice.getDnDetail(ctx.params.dnId));
+  }
+
+  async waferDefectResult() {
+    const { ctx } = this;
+    ctx.body = this.ok(await ctx.service.yeDefectNotice.getWaferDefectResult({
+      lotId: String(ctx.query.lotId || '').trim(),
+      waferId: String(ctx.query.waferId || '').trim(),
+      recipe: String(ctx.query.recipe || '').trim(),
+      defectCode: String(ctx.query.defectCode || '').trim(),
+      stepSeq: String(ctx.query.stepSeq || '').trim(),
+      stage: String(ctx.query.stage || '').trim(),
+      tool: String(ctx.query.tool || '').trim(),
+      trackOutTime: String(ctx.query.trackOutTime || '').trim(),
+      source: String(ctx.query.source || 'dn').trim(),
+      oqa: String(ctx.query.oqa || '').toLowerCase() === 'true',
+    }));
+  }
+
+  async similarDns() {
+    const { ctx } = this;
+    ctx.body = this.ok(await ctx.service.yeDefectNotice.getSimilarDns({
+      tech: String(ctx.query.tech || '').trim(),
+      stage: String(ctx.query.stage || '').trim(),
+      defect: String(ctx.query.defect || '').trim(),
+      startTime: String(ctx.query.startTime || '').trim(),
+      endTime: String(ctx.query.endTime || '').trim(),
+      excludeDnId: String(ctx.query.excludeDnId || '').trim(),
+    }));
+  }
+
+  async suspectSteps() {
+    const { ctx } = this;
+    ctx.body = this.ok(await ctx.service.yeDefectNotice.getSuspectSteps({
+      lotId: String(ctx.query.lotId || '').trim(),
+      dnId: String(ctx.query.dnId || '').trim(),
+      waferId: String(ctx.query.waferId || '').trim(),
+    }));
+  }
+
+  async suspectStepDetail() {
+    const { ctx } = this;
+    ctx.body = this.ok(await ctx.service.yeDefectNotice.getSuspectStepDetail({
+      dnId: String(ctx.query.dnId || '').trim(),
+      lotId: String(ctx.query.lotId || '').trim(),
+      stepSeq: String(ctx.query.stepSeq || '').trim(),
+      trackOutTime: String(ctx.query.trackOutTime || '').trim(),
+      stepDesc: String(ctx.query.stepDesc || '').trim(),
+    }));
+  }
+
+  private ok(data: unknown) {
+    return { success: true, data };
+  }
+}
+
+
+
+service
+import { Service } from 'egg';
+
+type Row = Record<string, any>;
+
+interface DnOptionQuery {
+  keyword?: string;
+  lotId?: string;
+}
+
+interface WaferDefectQuery {
+  lotId: string;
+  waferId: string;
+  recipe: string;
+  defectCode: string;
+  stepSeq?: string;
+  stage?: string;
+  tool?: string;
+  trackOutTime?: string;
+  source?: string;
+  oqa?: boolean;
+}
+
+interface SimilarDnQuery {
+  tech?: string;
+  stage: string;
+  defect: string;
+  startTime: string;
+  endTime: string;
+  excludeDnId?: string;
+}
+
+interface SuspectStepQuery {
+  lotId: string;
+  dnId?: string;
+  waferId?: string;
+}
+
+interface SuspectStepDetailQuery {
+  dnId?: string;
+  lotId: string;
+  stepSeq: string;
+  trackOutTime?: string;
+  stepDesc?: string;
+}
+
+export default class YeDefectNoticeService extends Service {
+  async getLotBasicBundle(lotId: string) {
+    this.assertRequired(lotId, 'lotId is required');
+
+    const [dnId, basicRaw, lotHistory, defectCodes, waferList, modules] = await Promise.all([
+      this.getNewDnId(),
+      this.getLotBasicInfo(lotId),
+      this.getFilteredLotHistory(lotId),
+      this.getDefectCodes(),
+      this.getWaferList(lotId),
+      this.getModuleOptions(),
+    ]);
+
+    const basicInfo = await this.decorateLotBasicInfo(basicRaw);
+    return {
+      dnId,
+      basicInfo,
+      lotHistory,
+      scanSteps: this.getYeScanSteps(lotHistory),
+      defectCodes,
+      waferList,
+      modules,
+    };
+  }
+
+  async getDnOptions(query: DnOptionQuery) {
+    const where: string[] = [ 't.dn_id is not null' ];
+    const binds: Row = {};
+
+    if (query.lotId) {
+      where.push('t.lotid = :lotId');
+      binds.lotId = query.lotId;
+    }
+    if (query.keyword) {
+      where.push(`(
+        upper(t.dn_id) like upper(:keyword)
+        or upper(t.lotid) like upper(:keyword)
+        or upper(t.defectcode) like upper(:keyword)
+      )`);
+      binds.keyword = `%${query.keyword}%`;
+    }
+
+    const rows = await this.queryRows(`
+      select *
+        from (
+          select t.dn_id,
+                 t.dn_class,
+                 t.lotid,
+                 t.defectcode,
+                 t.scan_recipe
+            from espt_ye_dn_case t
+           where ${where.join(' and ')}
+           order by t.dn_id desc
+        )
+       where rownum <= 100
+    `, binds);
+
+    return {
+      items: rows.map(row => ({
+        dnId: row.dn_id,
+        dnClass: row.dn_class,
+        lotId: row.lotid,
+        defectCode: row.defectcode,
+        scanRecipe: row.scan_recipe,
+        label: `${row.dn_id} ${row.dn_class || ''} ${row.lotid || ''} ${row.defectcode || ''} ${row.scan_recipe || ''}`.trim(),
+      })),
+    };
+  }
+
+  async getDnDetail(dnId: string) {
+    this.assertRequired(dnId, 'dnId is required');
+
+    const dnInfo = await this.queryOne(`
+      select *
+        from espt_ye_dn_case t
+       where t.dn_id = :dnId
+    `, { dnId });
+    this.assertRequired(dnInfo, `DN not found: ${dnId}`);
+
+    const lotId = dnInfo.lotid;
+    const [ basicRaw, lotHistory, defectCodes, waferList, modules, defectRows ] = await Promise.all([
+      this.getLotBasicInfo(lotId),
+      this.getSavedLotHistory(dnId, lotId),
+      this.getDefectCodes(),
+      this.getWaferList(lotId),
+      this.getModuleOptions(),
+      this.getSavedDefectSummary(dnId),
+    ]);
+
+    return {
+      dnId,
+      lotId,
+      basicInfo: await this.decorateLotBasicInfo({
+        ...basicRaw,
+        priority: dnInfo.lotpri || basicRaw.priority,
+        techg: dnInfo.tech || basicRaw.techg,
+        flowName: dnInfo.flowid || basicRaw.flowName,
+        lotOwner: dnInfo.lot_owner || basicRaw.lotOwner,
+        scraplimit: dnInfo.limit_scrap || basicRaw.scraplimit,
+      }),
+      lotHistory,
+      scanSteps: this.getYeScanSteps(lotHistory),
+      scanStepKey: this.findHistoryKey(lotHistory, dnInfo.scan_stepseq, dnInfo.scan_time),
+      defectCode: dnInfo.defectcode,
+      dnWafer: dnInfo.wafer_ng || dnInfo.wafer_scanned || '',
+      defectCodes,
+      waferList,
+      modules,
+      defectResult: defectRows.length ? { summary: this.normalizeDefectSummary(defectRows[0]) } : undefined,
+    };
+  }
+
+  async getWaferDefectResult(query: WaferDefectQuery) {
+    this.assertRequired(query.lotId, 'lotId is required');
+    this.assertRequired(query.waferId, 'waferId is required');
+    this.assertRequired(query.recipe, 'recipe is required');
+    this.assertRequired(query.defectCode, 'defectCode is required');
+
+    const summaryRows = query.oqa
+      ? await this.getWaferDefectInfoOqa(query)
+      : await this.getWaferDefectInfo(query);
+
+    if (!summaryRows.length) {
+      return {
+        summary: {},
+        dies: [],
+        defects: [],
+        trend: [],
+        pareto: [],
+        images: [],
+        ng: false,
+      };
+    }
+
+    const summary = this.normalizeDefectSummary(summaryRows[0]);
+    const recipeForMap = query.recipe;
+    const inspTool = query.tool || summary.inspect_equip_id || '';
+    const inspTime = this.formatOracleDate(summary.inspection_time || query.trackOutTime);
+
+    const [ dies, defects, trend, pareto, images ] = await Promise.all([
+      this.getAllDieCoordinates(query.lotId, query.waferId, recipeForMap, inspTool, inspTime),
+      this.getAllDefectCoordinates(query.lotId, query.waferId, recipeForMap, inspTool, inspTime, query.defectCode),
+      this.getDefectTrend(query.recipe, query.defectCode, inspTool, [ `${this.baseLot(query.lotId)}#${query.waferId}` ]),
+      this.getDefectPareto(query.lotId, query.waferId, recipeForMap, inspTool, inspTime),
+      this.getDefectImages(query.lotId, query.waferId, recipeForMap, inspTool, inspTime, query.defectCode),
+    ]);
+
+    return {
+      summary,
+      dies,
+      defects,
+      trend,
+      pareto,
+      images,
+      ng: Number(summary.dc || 0) > 0,
+      source: query.source || 'dn',
+    };
+  }
+
+  async getSimilarDns(query: SimilarDnQuery) {
+    this.assertRequired(query.stage, 'stage is required');
+    this.assertRequired(query.defect, 'defect is required');
+    this.assertRequired(query.startTime, 'startTime is required');
+    this.assertRequired(query.endTime, 'endTime is required');
+
+    const stageCondition = /^[MT]/i.test(query.stage)
+      ? `t.scan_stage like :stage`
+      : `t.scan_stage = :stage`;
+    const stageBind = /^[MT]/i.test(query.stage)
+      ? `${query.stage.substring(0, 1)}_${query.stage.substring(2)}`
+      : query.stage;
+
+    const rows = await this.queryRows(`
+      select t.dn_id,
+             t.dn_class,
+             t.lotid,
+             t.product,
+             t.tech,
+             t.scan_stage,
+             t.scan_recipe,
+             t.scan_machine,
+             t.defectcode,
+             t.dn_status
+        from espt_ye_dn_case t
+       where ${stageCondition}
+         and t.defectcode = :defect
+         and (:excludeDnId is null or t.dn_id <> :excludeDnId)
+         and t.dn_id in (
+           select distinct a.dn_no
+             from espt_ye_dn_action_log_temp a
+            where a.action like 'Initial DN%'
+              and a.action_time between to_date(:startTime, 'yyyy-mm-dd')
+                                  and to_date(:endTime, 'yyyy-mm-dd') + 1 - 1 / 1440
+         )
+       order by t.dn_id
+    `, {
+      stage: stageBind,
+      defect: query.defect,
+      excludeDnId: query.excludeDnId || null,
+      startTime: query.startTime,
+      endTime: query.endTime,
+    });
+
+    return { items: rows };
+  }
+
+  async getSuspectSteps(query: SuspectStepQuery) {
+    this.assertRequired(query.lotId, 'lotId is required');
+
+    const [ lotHistory, usedSteps, modules ] = await Promise.all([
+      this.getFilteredLotHistory(query.lotId, query.waferId),
+      query.dnId ? this.getExistingSuspectStepKeys(query.dnId) : Promise.resolve(new Set<string>()),
+      this.getModuleOptions(),
+    ]);
+
+    const items = lotHistory
+      .filter(step => !usedSteps.has(`${step.stepseq || ''}__${step.trackouttime || ''}__${step.stepdesc || 'Null'}`))
+      .map(step => ({
+        ...step,
+        suspectKey: `${step.stepseq || ''}__${step.trackouttime || ''}__${step.stepdesc || 'Null'}`,
+        label: `${step.stepseq || ''}__${step.trackouttime || ''}__${step.stepdesc || 'Null'}`,
+        informedModule: this.guessModule(step),
+      }));
+
+    return { items, modules };
+  }
+
+  async getSuspectStepDetail(query: SuspectStepDetailQuery) {
+    this.assertRequired(query.lotId, 'lotId is required');
+    this.assertRequired(query.stepSeq, 'stepSeq is required');
+
+    const lotHistory = await this.getFilteredLotHistory(query.lotId);
+    const detail = lotHistory.find(step => {
+      const desc = step.stepdesc || 'Null';
+      return String(step.stepseq || '') === query.stepSeq
+        && (!query.trackOutTime || String(step.trackouttime || '') === query.trackOutTime)
+        && (!query.stepDesc || desc === query.stepDesc);
+    });
+
+    if (!detail) return { detail: {}, modules: await this.getModuleOptions() };
+
+    const [ ngWafers, stepWafers, modules ] = await Promise.all([
+      query.dnId ? this.getNgWafers(query.dnId) : Promise.resolve([]),
+      this.getStepWaferList(query.lotId, query.stepSeq),
+      this.getModuleOptions(),
+    ]);
+
+    const missing = stepWafers.length ? ngWafers.filter(wf => !stepWafers.includes(wf)) : [];
+    const warning = stepWafers.length === 0
+      ? 'No wafer list was found for this process step. Please confirm the selected suspect step.'
+      : missing.length
+        ? `${missing.join(',')} not found in process step wafer list ${stepWafers.join(',')}. Please confirm the selected suspect step.`
+        : '';
+
+    return {
+      detail: {
+        ...detail,
+        informedModule: this.guessModule(detail),
+      },
+      modules,
+      warning,
+    };
+  }
+
+  private async getLotBasicInfo(lotId: string) {
+    const row = await this.queryOne(`
+      select t.lotname,
+             t.productname as productspecname,
+             t.priority,
+             substr(t.productname, 1, 4) as prodbody,
+             t.productflowname as processflowname,
+             t.productquantity,
+             t.lotowner
+        from rpt.base_lot t
+       where t.lotname = :lotId
+    `, { lotId });
+    this.assertRequired(row, `Lot not found: ${lotId}`);
+    return row;
+  }
+
+  private async decorateLotBasicInfo(basic: Row) {
+    if (!basic) return {};
+
+    const [ flowName, lotOwner, maskInfo ] = await Promise.all([
+      basic.flowName ? Promise.resolve(basic.flowName) : this.getFlowName(basic.productspecname),
+      basic.lotOwner ? Promise.resolve(basic.lotOwner) : this.getUserLabel(basic.lotowner),
+      basic.techg ? Promise.resolve(basic) : this.getLotMaskInfo(basic.prodbody),
+    ]);
+
+    return {
+      ...basic,
+      flowName: flowName || basic.processflowname || '',
+      lotOwner: lotOwner || basic.lotowner || '',
+      techg: maskInfo.techg || basic.techg || '',
+      shotSize: String(maskInfo.mask || '').split('*')[0] || basic.shotSize || '',
+      scraplimit: maskInfo.scraplimit || basic.scraplimit || '',
+      yesponsor: maskInfo.yesponsor || basic.yesponsor || '',
+    };
+  }
+
+  private async getFilteredLotHistory(lotId: string, waferId = '') {
+    const baseLot = this.baseLot(lotId);
+    const [ lotHistory, stepTimeInfo, chamberHistory ] = await Promise.all([
+      this.getLotHistoryNew(baseLot),
+      this.getStepHistoryNew(baseLot),
+      waferId ? this.getChamberHistoryNew(baseLot, waferId) : Promise.resolve([]),
+    ]);
+
+    const timeRows = chamberHistory.length
+      ? stepTimeInfo.concat(chamberHistory).filter(row => row.flag === 'key')
+      : stepTimeInfo;
+
+    const timeMap = new Map<string, Row>();
+    for (const row of timeRows) {
+      timeMap.set(this.historyMatchKey(row), row);
+    }
+
+    const merged = lotHistory
+      .map(row => {
+        const matched = timeMap.get(this.historyMatchKey(row));
+        const normalized = {
+          ...row,
+          stepseq: row.stepseq || row.stepsequence || '',
+          machinename: row.machinename || row.machine || '',
+          productspecname: row.productspecname || row.product || '',
+          trackintime: matched?.trackintime || row.trackintime || '',
+        };
+        return this.decorateHistoryRow(normalized);
+      })
+      .filter(row => row.trackintime);
+
+    return merged
+      .sort((a, b) => {
+        const timeCompare = String(b.trackintime || '').localeCompare(String(a.trackintime || ''));
+        if (timeCompare) return timeCompare;
+        return String(b.stepseq || '').localeCompare(String(a.stepseq || ''));
+      })
+      .map((row, index) => ({
+        ...row,
+        historyKey: `${row.stepseq || ''}_${row.trackouttime || ''}_${index}`,
+      }));
+  }
+
+  private async getLotHistoryNew(lotId: string) {
+    return await this.queryRows(`
+      select a.lotname,
+             a.productqty,
+             a.priority,
+             a.stage,
+             a.stepsequence,
+             a.stepsequence as stepseq,
+             a.operation,
+             a.stepdescription as stepdesc,
+             a.machinename,
+             a.recipe,
+             a.trackintime,
+             a.trackouttime,
+             a.event,
+             a.productname as productspecname,
+             a.lottype
+        from rpt.lot_step_history a
+       where a.lotname = :lotId
+       order by a.trackouttime desc, a.stepsequence desc
+    `, { lotId });
+  }
+
+  private async getStepHistoryNew(lotId: string) {
+    return await this.queryRows(`
+      select a.lotname,
+             a.stepsequence,
+             a.stepsequence as stepseq,
+             a.stage,
+             a.event,
+             a.machinename,
+             a.trackintime,
+             a.trackouttime,
+             'key' as flag
+        from rpt.lot_step_history a
+       where a.lotname = :lotId
+         and a.trackintime is not null
+    `, { lotId });
+  }
+
+  private async getChamberHistoryNew(lotId: string, waferId: string) {
+    return await this.queryRows(`
+      select y.lotid as lotname,
+             y.currentflowseq as stepsequence,
+             y.currentflowseq as stepseq,
+             y.stage,
+             y.event,
+             y.machinename,
+             y.trackintime,
+             y.trackouttime,
+             'key' as flag
+        from rpt.chamber_history y
+       where y.lotid = :lotId
+         and substr(y.waferid, instr(y.waferid, '#') + 1) = :waferId
+    `, { lotId, waferId: waferId.replace(/^#/, '') });
+  }
+
+  private async getSavedLotHistory(dnId: string, fallbackLotId: string) {
+    const rows = await this.queryRows(`
+      select case when t.currentsite is not null then t.currentsite else 'FAB6' end as currentsite,
+             t.lot as lotname,
+             t.qty as productqty,
+             t.priority,
+             t.stage,
+             t.stepseq,
+             t.operation,
+             t.stepdesc,
+             t.machine as machinename,
+             t.recipe,
+             to_char(to_date(t.trackintime, 'yyyy/mm/dd hh24:mi:ss'), 'yyyy/mm/dd hh24:mi:ss') as trackintime,
+             to_char(to_date(t.trackouttime, 'yyyy/mm/dd hh24:mi:ss'), 'yyyy/mm/dd hh24:mi:ss') as trackouttime,
+             t.event,
+             t.product as productspecname,
+             t.lottype
+        from espt_ye_dn_lot_history_temp t
+       where t.dn_id = :dnId
+       order by to_date(t.trackintime, 'yyyy/mm/dd hh24:mi:ss') desc, t.stepseq desc
+    `, { dnId });
+
+    if (rows.length) {
+      return rows.map((row, index) => ({ ...row, historyKey: `${row.stepseq || ''}_${row.trackouttime || ''}_${index}` }));
+    }
+    return await this.getFilteredLotHistory(fallbackLotId);
+  }
+
+  private async getWaferDefectInfo(query: WaferDefectQuery) {
+    const { product, layerId } = this.parseRecipe(query.recipe);
+    const rows = await this.queryRows(`
+      select tt.*,
+             decode(tt.reviewDieCnt, 0, 0,
+                    round(((tt.defectDieCnt / tt.reviewDieCnt) * tt.totalDieCnt) / tt.inspected_die, 4)) as ndd_new
+        from (
+          select distinct t.layer_id,
+                 t.wafer_key,
+                 t.inspection_time,
+                 t.inspected_die,
+                 t.inspect_equip_id,
+                 t.defects as tc,
+                 (select count(a.class_number)
+                    from insp_defect a
+                   where a.inspection_time = t.inspection_time
+                     and t.wafer_key = a.wafer_key
+                     and a.class_number <> '0') as rdc,
+                 (select count(a.class_number)
+                    from insp_defect a
+                   where a.inspection_time = t.inspection_time
+                     and t.wafer_key = a.wafer_key
+                     and a.class_number = :defectCode) as dc,
+                 t.adder_random_defects as ac,
+                 round((select count(distinct a.index_x || '#' || a.index_y)
+                          from insp_defect a
+                         where a.inspection_time = t.inspection_time
+                           and t.wafer_key = a.wafer_key
+                           and a.class_number = :defectCode) / t.inspected_die, 4) as ndd,
+                 (select count(distinct b.index_x || '_' || b.index_y)
+                    from insp_defect b
+                   where b.inspection_time = t.inspection_time
+                     and t.wafer_key = b.wafer_key) as totalDieCnt,
+                 (select count(distinct b.index_x || '_' || b.index_y)
+                    from insp_defect b
+                   where b.inspection_time = t.inspection_time
+                     and t.wafer_key = b.wafer_key
+                     and b.class_number = :defectCode) as defectDieCnt,
+                 (select count(distinct b.index_x || '_' || b.index_y)
+                    from insp_defect b
+                   where b.inspection_time = t.inspection_time
+                     and t.wafer_key = b.wafer_key
+                     and b.class_number <> '0') as reviewDieCnt
+            from insp_wafer_summary t,
+                 insp_defect b
+           where t.lot_id = :lotId
+             and t.wafer_id = :waferId
+             and b.inspection_time = t.inspection_time
+             and t.wafer_key = b.wafer_key
+             and t.layer_id in (:layerId, :layerIdT)
+        ) tt
+       order by tt.inspection_time desc
+    `, {
+      lotId: query.lotId,
+      waferId: query.waferId,
+      defectCode: query.defectCode,
+      layerId,
+      layerIdT: `${layerId}_T`,
+    });
+
+    if (!(await this.isHGroupProduct(product)) || !rows.length) return rows;
+    return rows;
+  }
+
+  private async getWaferDefectInfoOqa(query: WaferDefectQuery) {
+    return await this.queryRows(`
+      select tt.*,
+             decode(tt.reviewDieCnt, 0, 0,
+                    round(((tt.defectDieCnt / tt.reviewDieCnt) * tt.totalDieCnt) / tt.inspected_die, 4)) as ndd_new
+        from (
+          select distinct t.layer_id,
+                 t.wafer_key,
+                 t.inspection_time,
+                 t.inspected_die,
+                 t.inspect_equip_id,
+                 t.defects as tc,
+                 (select count(a.class_number)
+                    from insp_defect a
+                   where a.inspection_time = t.inspection_time
+                     and t.wafer_key = a.wafer_key
+                     and a.class_number <> '0') as rdc,
+                 (select count(a.class_number)
+                    from insp_defect a
+                   where a.inspection_time = t.inspection_time
+                     and t.wafer_key = a.wafer_key
+                     and a.class_number = :defectCode) as dc,
+                 t.adder_random_defects as ac,
+                 round(t.defective_die / t.inspected_die, 4) as ndd,
+                 (select count(distinct b.index_x || '_' || b.index_y)
+                    from insp_defect b
+                   where b.inspection_time = t.inspection_time
+                     and t.wafer_key = b.wafer_key) as totalDieCnt,
+                 (select count(distinct b.index_x || '_' || b.index_y)
+                    from insp_defect b
+                   where b.inspection_time = t.inspection_time
+                     and t.wafer_key = b.wafer_key
+                     and b.class_number = :defectCode) as defectDieCnt,
+                 (select count(distinct b.index_x || '_' || b.index_y)
+                    from insp_defect b
+                   where b.inspection_time = t.inspection_time
+                     and t.wafer_key = b.wafer_key
+                     and b.class_number <> '0') as reviewDieCnt
+            from insp_wafer_summary t,
+                 insp_defect b,
+                 insp_recipe e
+           where t.lot_id = :lotId
+             and t.wafer_id = :waferId
+             and b.inspection_time = t.inspection_time
+             and t.wafer_key = b.wafer_key
+             and t.recipe_key = e.recipe_key
+             and e.recipe_id = :recipe
+        ) tt
+       order by tt.inspection_time desc
+    `, {
+      lotId: query.lotId,
+      waferId: query.waferId,
+      defectCode: query.defectCode,
+      recipe: query.recipe,
+    });
+  }
+
+  private normalizeDefectSummary(row: Row) {
+    const tc = Number(row.tc ?? row.TC ?? 0);
+    const rdc = Number(row.rdc ?? row.RDC ?? 0);
+    const dc = Number(row.dc ?? row.DC ?? 0);
+    const ac = Number(row.ac ?? row.AC ?? 0);
+    const ndd = Number(row.ndd ?? row.NDD ?? 0);
+    const nddNew = Number(row.ndd_new ?? row.nddNew ?? row.NDD_NEW ?? 0);
+    const ndc = ac >= rdc ? (rdc === 0 ? '' : Math.round((dc * ac) / rdc)) : dc;
+
+    return {
+      ...row,
+      tc,
+      rdc,
+      dc,
+      ac,
+      ndd,
+      nddNew,
+      ndc,
+      nddPercent: Number.isFinite(ndd) ? (ndd * 100).toFixed(2) : '',
+      nddNewPercent: Number.isFinite(nddNew) ? (nddNew * 100).toFixed(2) : '',
+    };
+  }
+
+  private async getAllDieCoordinates(lotId: string, waferId: string, recipe: string, inspTool: string, inspTime: string) {
+    if (!inspTool || !inspTime) return [];
+    return await this.queryRows(`
+      select distinct t.index_x - e.origin_index_x as index_x,
+             t.index_y - e.origin_index_y as index_y
+        from udb.insp_region t,
+             udb.insp_wafer_summary y,
+             udb.insp_recipe e
+       where t.recipe_key = y.recipe_key
+         and e.recipe_key = y.recipe_key
+         and e.device = y.device
+         and e.layer_id = y.layer_id
+         and y.lot_id = :lotId
+         and y.wafer_id = :waferId
+         and e.recipe_id like :recipe
+         and y.inspect_equip_id = :inspTool
+         and y.inspection_time = to_date(:inspTime, 'yyyy/mm/dd hh24:mi:ss')
+    `, {
+      lotId,
+      waferId,
+      recipe: `${recipe}%`,
+      inspTool,
+      inspTime,
+    });
+  }
+
+  private async getAllDefectCoordinates(
+    lotId: string,
+    waferId: string,
+    recipe: string,
+    inspTool: string,
+    inspTime: string,
+    defectCode: string,
+  ) {
+    if (!inspTool || !inspTime) return [];
+    const rows = await this.queryRows(`
+      select d.index_x - r.origin_index_x as die_x,
+             d.index_y - r.origin_index_y as die_y,
+             (d.wafer_x - d.index_x * r.die_size_x) / 1000.0 as defect_in_die_x,
+             (d.wafer_y - d.index_y * r.die_size_y) / 1000.0 as defect_in_die_y,
+             r.die_size_x / 1000 as die_size_x,
+             r.die_size_y / 1000 as die_size_y,
+             a.name || '_' || a.code as defect_class,
+             w.inspection_time,
+             w.inspect_equip_id
+        from insp_defect d,
+             insp_wafer_summary w,
+             insp_recipe r,
+             (
+               select distinct h.code, h.name
+                 from insp_decode h
+                where h.parm_key = 2
+             ) a
+       where d.inspection_time = w.inspection_time
+         and d.wafer_key = w.wafer_key
+         and w.recipe_key = r.recipe_key
+         and d.class_number = a.code
+         and w.lot_id = :lotId
+         and w.wafer_id = :waferId
+         and r.recipe_id like :recipe
+         and w.inspect_equip_id = :inspTool
+         and w.inspection_time = to_date(:inspTime, 'yyyy/mm/dd hh24:mi:ss')
+         and (:defectCode is null or d.class_number = :defectCode or a.name || '_' || a.code = :defectCode)
+    `, {
+      lotId,
+      waferId,
+      recipe: `${recipe}%`,
+      inspTool,
+      inspTime,
+      defectCode: defectCode || null,
+    });
+
+    return rows.map(row => ({
+      index_x: Number(row.die_x || 0) + Number(row.defect_in_die_x || 0) / Math.max(Number(row.die_size_x || 1), 1),
+      index_y: Number(row.die_y || 0) + Number(row.defect_in_die_y || 0) / Math.max(Number(row.die_size_y || 1), 1),
+      defect_class: row.defect_class,
+      time: row.inspection_time,
+      tool: row.inspect_equip_id,
+    }));
+  }
+
+  private async getDefectTrend(recipe: string, defectCode: string, machine: string, dnWafers: string[]) {
+    const rows = await this.queryRows(`
+      select *
+        from (
+          select distinct t.lot_id,
+                 t.wafer_id,
+                 r.recipe_id,
+                 t.inspection_time,
+                 t.defects as tc,
+                 (select count(a.class_number)
+                    from insp_defect a
+                   where a.inspection_time = t.inspection_time
+                     and t.wafer_key = a.wafer_key
+                     and a.images <> 0) as rdc,
+                 (select count(a.class_number)
+                    from insp_defect a
+                   where a.inspection_time = t.inspection_time
+                     and t.wafer_key = a.wafer_key
+                     and a.class_number = :defectCode) as dc,
+                 t.adder_random_defects as ac
+            from insp_wafer_summary t,
+                 insp_recipe r
+           where t.recipe_key = r.recipe_key
+             and r.recipe_id like :recipe
+             and (:machine is null or t.inspect_equip_id = :machine)
+             and length(t.lot_id) >= 7
+             and t.inspection_time >= sysdate - interval '3' year
+           order by t.inspection_time desc, t.wafer_id desc
+        )
+       where rownum <= 100
+    `, {
+      recipe: `${recipe}%`,
+      machine: machine || null,
+      defectCode,
+    });
+
+    return rows.reverse().map(row => {
+      const key = `${row.lot_id}#${row.wafer_id}`;
+      return {
+        ...row,
+        key,
+        value: row.tc,
+        highlight: dnWafers.includes(key),
+      };
+    });
+  }
+
+  private async getDefectPareto(lotId: string, waferId: string, recipe: string, inspTool: string, inspTime: string) {
+    if (!inspTool || !inspTime) return [];
+    return await this.queryRows(`
+      select *
+        from (
+          select a.name || '_' || a.code as name,
+                 count(*) as value
+            from insp_defect d,
+                 insp_wafer_summary w,
+                 insp_recipe r,
+                 insp_decode a
+           where d.inspection_time = w.inspection_time
+             and d.wafer_key = w.wafer_key
+             and w.recipe_key = r.recipe_key
+             and d.class_number = a.code
+             and a.parm_key = 2
+             and w.lot_id = :lotId
+             and w.wafer_id = :waferId
+             and r.recipe_id like :recipe
+             and w.inspect_equip_id = :inspTool
+             and w.inspection_time = to_date(:inspTime, 'yyyy/mm/dd hh24:mi:ss')
+           group by a.name || '_' || a.code
+           order by count(*) desc
+        )
+       where rownum <= 20
+    `, {
+      lotId,
+      waferId,
+      recipe: `${recipe}%`,
+      inspTool,
+      inspTime,
+    });
+  }
+
+  private async getDefectImages(
+    lotId: string,
+    waferId: string,
+    recipe: string,
+    inspTool: string,
+    inspTime: string,
+    defectCode: string,
+  ) {
+    const rows = await this.queryRows(`
+      select *
+        from (
+          select d.defect_id,
+                 d.class_number,
+                 a.name || '_' || a.code as defect_class,
+                 d.image_file as url,
+                 d.image_file as name
+            from insp_defect d,
+                 insp_wafer_summary w,
+                 insp_recipe r,
+                 insp_decode a
+           where d.inspection_time = w.inspection_time
+             and d.wafer_key = w.wafer_key
+             and w.recipe_key = r.recipe_key
+             and d.class_number = a.code
+             and a.parm_key = 2
+             and w.lot_id = :lotId
+             and w.wafer_id = :waferId
+             and r.recipe_id like :recipe
+             and w.inspect_equip_id = :inspTool
+             and w.inspection_time = to_date(:inspTime, 'yyyy/mm/dd hh24:mi:ss')
+             and (:defectCode is null or d.class_number = :defectCode or a.name || '_' || a.code = :defectCode)
+             and d.images <> 0
+           order by d.defect_id
+        )
+       where rownum <= 12
+    `, {
+      lotId,
+      waferId,
+      recipe: `${recipe}%`,
+      inspTool,
+      inspTime,
+      defectCode: defectCode || null,
+    }).catch(() => []);
+
+    return rows.filter(row => row.url);
+  }
+
+  private getYeScanSteps(lotHistory: Row[]) {
+    return lotHistory
+      .filter(row => /^(BIYOCAP|BYY|SRC)/i.test(String(row.operation || '')))
+      .sort((a, b) => String(b.trackouttime || '').localeCompare(String(a.trackouttime || '')))
+      .map(row => ({
+        key: row.historyKey,
+        label: `${row.stepseq || ''}_${row.trackouttime || ''}_${row.stage || ''}`,
+        raw: row,
+      }));
+  }
+
+  private async getNewDnId() {
+    const row = await this.queryOne(`
+      select max(substr(t.dn_id, length(t.dn_id) - 1)) as cnt
+        from espt_ye_dn_case t
+       where t.dn_id like :prefix
+    `, { prefix: `%${this.todayYmd()}%` });
+    const count = Number(row?.cnt || 0) + 1;
+    return `DN-${this.todayYmd()}-${String(count).padStart(2, '0')}`;
+  }
+
+  private async getFlowName(productSpecName: string) {
+    if (!productSpecName) return '';
+    const row = await this.queryOne(`
+      select t.processflowname
+        from espt_prod_info_basic t
+       where t.productspecname = :productSpecName
+    `, { productSpecName });
+    return row?.processflowname || '';
+  }
+
+  private async getUserLabel(userId: string) {
+    if (!userId) return '';
+    if (String(userId).length > 5) return userId;
+    const row = await this.queryOne(`
+      select t.userid || '(' || t.name || ')' as label
+        from espt_sys_user_list t
+       where t.userid = :userId
+    `, { userId });
+    return row?.label || '';
+  }
+
+  private async getLotMaskInfo(prodBody: string) {
+    if (!prodBody) return {};
+    return await this.queryOne(`
+      select a.dielayout as mask,
+             t.techg,
+             a.scraplimit,
+             a.yesponsor
+        from espt_prodgroup_info_basic t,
+             espt_prodgroup_info_defect a
+       where a.prodbody = t.prodbody
+         and t.prodbody = :prodBody
+    `, { prodBody }) || {};
+  }
+
+  private async getDefectCodes() {
+    const rows = await this.queryRows(`
+      select distinct h.name || '_' || h.code as code
+        from insp_decode h
+       where h.parm_key = 2
+       order by h.name || '_' || h.code
+    `).catch(() => []);
+    return rows.map(row => row.code).filter(Boolean);
+  }
+
+  private async getWaferList(lotId: string) {
+    const rows = await this.queryRows(`
+      select distinct '#' || lpad(t.wafer_id, 2, '0') as wafer
+        from insp_wafer_summary t
+       where t.lot_id = :lotId
+       order by '#' || lpad(t.wafer_id, 2, '0')
+    `, { lotId: this.baseLot(lotId) }).catch(() => []);
+    return rows.map(row => row.wafer).filter(Boolean);
+  }
+
+  private async getModuleOptions() {
+    const rows = await this.queryRows(`
+      select distinct t.module as module
+        from espt_module_mapping t
+       where t.module is not null
+       order by t.module
+    `).catch(() => []);
+    return rows.map(row => row.module).filter(Boolean);
+  }
+
+  private async getSavedDefectSummary(dnId: string) {
+    return await this.queryRows(`
+      select *
+        from espt_ye_dn_case_defect_temp t
+       where t.dn_id = :dnId
+       order by t.wf#
+    `, { dnId }).catch(() => []);
+  }
+
+  private async getExistingSuspectStepKeys(dnId: string) {
+    const rows = await this.queryRows(`
+      select t.suspect_stepseq,
+             to_char(t.suspect_trackouttime, 'yyyy/mm/dd hh24:mi:ss') as suspect_trackouttime,
+             t.suspect_stepdesc
+        from espt_ye_dn_case_machine_temp2 t
+       where t.dn_id = :dnId
+    `, { dnId }).catch(() => []);
+
+    return new Set(rows.map(row => `${row.suspect_stepseq || ''}__${row.suspect_trackouttime || ''}__${row.suspect_stepdesc || 'Null'}`));
+  }
+
+  private async getNgWafers(dnId: string) {
+    const rows = await this.queryRows(`
+      select distinct t.wf# as wafer
+        from espt_ye_dn_case_defect_temp t
+       where t.dn_id = :dnId
+         and t.scanflag = 'scan'
+         and t.result = 'NG'
+    `, { dnId }).catch(() => []);
+    return rows.map(row => row.wafer).filter(Boolean);
+  }
+
+  private async getStepWaferList(lotId: string, stepSeq: string) {
+    const rows = await this.queryRows(`
+      select distinct substr(y.waferid, instr(y.waferid, '#')) as waferid
+        from rpt.chamber_history y
+       where y.lotid = :lotId
+         and y.currentflowseq = :stepSeq
+    `, { lotId: this.baseLot(lotId), stepSeq }).catch(() => []);
+    return rows.map(row => row.waferid).filter(Boolean);
+  }
+
+  private async isHGroupProduct(product: string) {
+    if (!product) return false;
+    const row = await this.queryOne(`
+      select 1 as hit
+        from v_espt_hgroup_prodbody t
+       where t.prodbody = :product
+         and rownum = 1
+    `, { product }).catch(() => null);
+    return Boolean(row);
+  }
+
+  private parseRecipe(recipe: string) {
+    const parts = String(recipe || '').split('_').filter(Boolean);
+    const product = parts[0] || '';
+    const layerId = parts.length > 2 ? `${parts[1]}_${parts[2]}` : parts[1] || '';
+    return { product, layerId };
+  }
+
+  private decorateHistoryRow(row: Row) {
+    const stepseq = String(row.stepseq || row.stepsequence || '');
+    if (stepseq.length === 6) return { ...row, stepseq };
+    return {
+      ...row,
+      stepseq: row.currentflowseq || stepseq,
+      stepdesc: row.stepdesc || row.stepdescription || '',
+    };
+  }
+
+  private historyMatchKey(row: Row) {
+    return [
+      row.lotname || row.lotid || '',
+      row.stepseq || row.stepsequence || '',
+      row.stage || '',
+      row.event || '',
+      row.machinename || row.machine || '',
+      this.formatOracleDate(row.trackouttime),
+    ].join('|');
+  }
+
+  private findHistoryKey(history: Row[], stepSeq: string, trackOutTime: string) {
+    return history.find(row =>
+      String(row.stepseq || '') === String(stepSeq || '')
+      && (!trackOutTime || String(row.trackouttime || '') === String(trackOutTime || '')),
+    )?.historyKey || '';
+  }
+
+  private guessModule(step: Row) {
+    const text = `${step.oldmachinecapability || ''} ${step.operation || ''} ${step.machinename || ''}`.toUpperCase();
+    if (text.includes('L-ADI') || text.includes('L-AEI') || text.includes('LITHO')) return 'Litho';
+    if (text.includes('ETCH')) return 'Etch';
+    if (text.includes('CMP')) return 'CMP';
+    if (text.includes('CVD') || text.includes('PVD') || text.includes('TF')) return 'ThinFilm';
+    if (text.includes('IMP')) return 'IMP';
+    return '';
+  }
+
+  private baseLot(lotId: string) {
+    return String(lotId || '').split('.')[0];
+  }
+
+  private todayYmd() {
+    const date = new Date();
+    const y = date.getFullYear();
+    const m = String(date.getMonth() + 1).padStart(2, '0');
+    const d = String(date.getDate()).padStart(2, '0');
+    return `${y}${m}${d}`;
+  }
+
+  private formatOracleDate(value: any) {
+    if (!value) return '';
+    if (value instanceof Date) {
+      const y = value.getFullYear();
+      const m = String(value.getMonth() + 1).padStart(2, '0');
+      const d = String(value.getDate()).padStart(2, '0');
+      const hh = String(value.getHours()).padStart(2, '0');
+      const mm = String(value.getMinutes()).padStart(2, '0');
+      const ss = String(value.getSeconds()).padStart(2, '0');
+      return `${y}/${m}/${d} ${hh}:${mm}:${ss}`;
+    }
+    return String(value).replace(/-/g, '/');
+  }
+
+  private assertRequired<T>(value: T, message: string): asserts value is NonNullable<T> {
+    if (value === undefined || value === null || value === '') {
+      this.ctx.throw(400, message);
+    }
+  }
+
+  private async queryOne<T extends Row = Row>(sql: string, binds: Row = {}) {
+    const rows = await this.queryRows<T>(sql, binds);
+    return rows[0];
+  }
+
+  private async queryRows<T extends Row = Row>(sql: string, binds: Row = {}): Promise<T[]> {
+    const client = (this.app as any).oracle || (this.app as any).oracledb || (this.ctx as any).oracle;
+    if (!client) {
+      this.ctx.throw(500, 'Oracle client is not configured. Expected app.oracle/app.oracledb/ctx.oracle.');
+    }
+
+    const executor = client.execute || client.query;
+    if (!executor) {
+      this.ctx.throw(500, 'Oracle client must expose execute(sql, binds) or query(sql, binds).');
+    }
+
+    const result = await executor.call(client, sql, binds);
+    const rows = Array.isArray(result) ? result : result.rows || [];
+    const meta = result.metaData || result.metadata || [];
+
+    return rows.map((row: any) => {
+      if (!Array.isArray(row)) return this.lowerKeys(row) as T;
+      const obj: Row = {};
+      meta.forEach((item: any, index: number) => {
+        obj[String(item.name || item).toLowerCase()] = row[index];
+      });
+      return obj as T;
+    });
+  }
+
+  private lowerKeys(row: Row) {
+    const obj: Row = {};
+    Object.entries(row || {}).forEach(([ key, value ]) => {
+      obj[key.toLowerCase()] = value;
+    });
+    return obj;
+  }
+}
+
+
+route：
+import { Application } from 'egg';
+
+export default (app: Application) => {
+  const { controller, router } = app;
+  const prefix = '/api/ye-defect-notice';
+
+  router.get(`${prefix}/lots/basic-info`, controller.yeDefectNotice.lotBasicInfo);
+  router.get(`${prefix}/dns/options`, controller.yeDefectNotice.dnOptions);
+  router.get(`${prefix}/dns/similar`, controller.yeDefectNotice.similarDns);
+  router.get(`${prefix}/dns/:dnId`, controller.yeDefectNotice.dnDetail);
+  router.get(`${prefix}/wafers/defect-result`, controller.yeDefectNotice.waferDefectResult);
+  router.get(`${prefix}/suspect-steps`, controller.yeDefectNotice.suspectSteps);
+  router.get(`${prefix}/suspect-steps/detail`, controller.yeDefectNotice.suspectStepDetail);
+};
+
+
+
+vue：
+<template>
+  <div class="dn-page">
+    <section class="toolbar">
+      <el-radio-group v-model="queryMode" size="small">
+        <el-radio-button label="new">New DN</el-radio-button>
+        <el-radio-button label="exist">Existing DN</el-radio-button>
+      </el-radio-group>
+
+      <el-input
+        v-model.trim="form.lotId"
+        class="lot-input"
+        clearable
+        placeholder="Lot ID"
+        @keyup.enter="handleGetDnInfo"
+      >
+        <template #prefix>
+          <el-icon><Search /></el-icon>
+        </template>
+      </el-input>
+
+      <el-select
+        v-if="queryMode === 'exist'"
+        v-model="form.dnNo"
+        class="dn-select"
+        filterable
+        clearable
+        remote
+        :remote-method="loadDnOptions"
+        placeholder="DN No"
+      >
+        <el-option
+          v-for="item in dnOptions"
+          :key="item.dnId"
+          :label="item.label"
+          :value="item.dnId"
+        />
+      </el-select>
+
+      <el-button type="primary" :loading="loading.lot" @click="handleGetDnInfo">
+        <el-icon><Download /></el-icon>
+        Get
+      </el-button>
+
+      <el-button :disabled="!canSearchSimilar" :loading="loading.similar" @click="handleSimilarSearch">
+        <el-icon><Connection /></el-icon>
+        Similar DN
+      </el-button>
+    </section>
+
+    <section class="summary-band">
+      <el-descriptions :column="4" border>
+        <el-descriptions-item label="DN">{{ form.dnNo || "-" }}</el-descriptions-item>
+        <el-descriptions-item label="Product">{{ lotBasic.productspecname || "-" }}</el-descriptions-item>
+        <el-descriptions-item label="Tech">{{ lotBasic.techg || "-" }}</el-descriptions-item>
+        <el-descriptions-item label="Priority">{{ lotBasic.priority || "-" }}</el-descriptions-item>
+        <el-descriptions-item label="Flow">{{ lotBasic.flowName || "-" }}</el-descriptions-item>
+        <el-descriptions-item label="Owner">{{ lotBasic.lotOwner || "-" }}</el-descriptions-item>
+        <el-descriptions-item label="Wafer Qty">{{ lotBasic.productquantity || "-" }}</el-descriptions-item>
+        <el-descriptions-item label="Scrap Limit">{{ lotBasic.scraplimit || "-" }}</el-descriptions-item>
+      </el-descriptions>
+    </section>
+
+    <section class="work-grid">
+      <div class="panel span-8">
+        <div class="panel-head">
+          <h2>Scan Step</h2>
+          <el-tag v-if="selectedScanStep.stage" effect="plain">{{ selectedScanStep.stage }}</el-tag>
+        </div>
+
+        <el-form label-width="110px" size="small">
+          <el-form-item label="Scan Step">
+            <el-select
+              v-model="form.scanStepKey"
+              filterable
+              clearable
+              placeholder="Select scan step"
+              @change="handleScanStepChange"
+            >
+              <el-option
+                v-for="step in scanStepOptions"
+                :key="step.key"
+                :label="step.label"
+                :value="step.key"
+              />
+            </el-select>
+          </el-form-item>
+
+          <el-form-item label="Stage">
+            <el-input v-model="selectedScanStep.stage" readonly />
+          </el-form-item>
+          <el-form-item label="Operation">
+            <el-input v-model="selectedScanStep.operation" readonly />
+          </el-form-item>
+          <el-form-item label="Recipe">
+            <el-input v-model="selectedScanStep.recipe" readonly />
+          </el-form-item>
+          <el-form-item label="Tool">
+            <el-input v-model="selectedScanStep.machinename" readonly />
+          </el-form-item>
+          <el-form-item label="Track Out">
+            <el-input v-model="selectedScanStep.trackouttime" readonly />
+          </el-form-item>
+        </el-form>
+      </div>
+
+      <div class="panel span-16">
+        <div class="panel-head">
+          <h2>Lot Step History</h2>
+          <el-segmented v-model="historyScope" :options="historyScopeOptions" size="small" />
+        </div>
+
+        <el-table
+          :data="visibleLotHistory"
+          height="360"
+          border
+          stripe
+          size="small"
+          row-key="historyKey"
+          :row-class-name="lotHistoryRowClass"
+        >
+          <el-table-column prop="stepseq" label="Step" width="90" />
+          <el-table-column prop="stage" label="Stage" width="90" />
+          <el-table-column prop="operation" label="Operation" min-width="140" />
+          <el-table-column prop="stepdesc" label="Description" min-width="160" />
+          <el-table-column prop="machinename" label="Machine" width="130" />
+          <el-table-column prop="recipe" label="Recipe" min-width="150" />
+          <el-table-column prop="trackintime" label="Track In" width="160" />
+          <el-table-column prop="trackouttime" label="Track Out" width="160" />
+        </el-table>
+      </div>
+    </section>
+
+    <section class="work-grid">
+      <div class="panel span-8">
+        <div class="panel-head">
+          <h2>Defect Query</h2>
+          <el-tag effect="plain">{{ defectModeLabel }}</el-tag>
+        </div>
+
+        <el-form label-width="110px" size="small">
+          <el-form-item label="Defect Type">
+            <el-select v-model="form.defectCode" filterable clearable placeholder="Class/Defect code">
+              <el-option v-for="code in defectCodeOptions" :key="code" :label="code" :value="code" />
+            </el-select>
+          </el-form-item>
+          <el-form-item label="DN Wafer">
+            <el-select v-model="form.dnWafer" filterable clearable placeholder="#01">
+              <el-option v-for="wf in waferOptions" :key="wf" :label="wf" :value="wf" />
+            </el-select>
+          </el-form-item>
+          <el-form-item label="Pre Scan">
+            <el-select v-model="form.preScanStepKey" filterable clearable placeholder="Optional pre step">
+              <el-option v-for="step in preScanOptions" :key="step.key" :label="step.label" :value="step.key" />
+            </el-select>
+          </el-form-item>
+          <el-form-item label="Add Scan WF">
+            <el-select v-model="form.addScanWafer" filterable clearable placeholder="Optional add scan wafer">
+              <el-option v-for="wf in waferOptions" :key="wf" :label="wf" :value="wf" />
+            </el-select>
+          </el-form-item>
+          <el-form-item>
+            <el-button type="primary" :loading="loading.defect" @click="loadWaferDefect('dn')">
+              <el-icon><Aim /></el-icon>
+              Get Defect
+            </el-button>
+            <el-button :disabled="!form.preScanStepKey" @click="loadWaferDefect('pre')">Pre Result</el-button>
+            <el-button :disabled="!form.addScanWafer" @click="loadWaferDefect('add')">Add Result</el-button>
+          </el-form-item>
+        </el-form>
+
+        <div class="metric-grid">
+          <div v-for="item in defectMetrics" :key="item.label" class="metric">
+            <span>{{ item.label }}</span>
+            <strong>{{ item.value }}</strong>
+          </div>
+        </div>
+      </div>
+
+      <div class="panel span-16 visual-panel">
+        <div class="panel-head">
+          <h2>Map / Image / Chart</h2>
+          <el-tabs v-model="visualTab" class="compact-tabs">
+            <el-tab-pane label="Map" name="map" />
+            <el-tab-pane label="Trend" name="trend" />
+            <el-tab-pane label="Pareto" name="pareto" />
+            <el-tab-pane label="Images" name="images" />
+          </el-tabs>
+        </div>
+
+        <div v-show="visualTab === 'map'" class="visual-body">
+          <WaferMapSvg :dies="activeVisual.dies" :defects="activeVisual.defects" :ng="activeVisual.ng" />
+        </div>
+
+        <div v-show="visualTab === 'trend'" class="visual-body">
+          <TrendChartSvg :points="activeVisual.trend" />
+        </div>
+
+        <div v-show="visualTab === 'pareto'" class="visual-body">
+          <ParetoChartSvg :items="activeVisual.pareto" />
+        </div>
+
+        <div v-show="visualTab === 'images'" class="image-grid">
+          <el-image
+            v-for="img in activeVisual.images"
+            :key="img.url"
+            :src="img.url"
+            :preview-src-list="activeVisual.images.map((x) => x.url)"
+            fit="contain"
+          >
+            <template #error>
+              <div class="image-empty">{{ img.name || "No Image" }}</div>
+            </template>
+          </el-image>
+        </div>
+      </div>
+    </section>
+
+    <section class="work-grid">
+      <div class="panel span-10">
+        <div class="panel-head">
+          <h2>Similar DN</h2>
+          <el-date-picker
+            v-model="form.similarRange"
+            type="daterange"
+            size="small"
+            value-format="YYYY-MM-DD"
+            start-placeholder="Start"
+            end-placeholder="End"
+          />
+        </div>
+        <el-table :data="similarDns" height="280" border stripe size="small">
+          <el-table-column prop="dn_id" label="DN" width="130" />
+          <el-table-column prop="lotid" label="Lot" width="120" />
+          <el-table-column prop="scan_stage" label="Stage" width="90" />
+          <el-table-column prop="scan_recipe" label="Recipe" min-width="150" />
+          <el-table-column prop="defectcode" label="Defect" min-width="130" />
+          <el-table-column prop="dn_status" label="Status" width="110" />
+        </el-table>
+      </div>
+
+      <div class="panel span-14">
+        <div class="panel-head">
+          <h2>Suspect Step / HL Module</h2>
+          <el-button size="small" :loading="loading.suspect" @click="loadSuspectSteps">
+            <el-icon><Refresh /></el-icon>
+            Load
+          </el-button>
+        </div>
+
+        <el-form label-width="120px" size="small" class="suspect-form">
+          <el-form-item label="Suspect Step">
+            <el-select
+              v-model="form.suspectStepKey"
+              filterable
+              clearable
+              placeholder="Step__TrackOut__Desc"
+              @visible-change="(visible) => visible && loadSuspectSteps()"
+              @change="handleSuspectStepChange"
+            >
+              <el-option v-for="step in suspectStepOptions" :key="step.key" :label="step.label" :value="step.key" />
+            </el-select>
+          </el-form-item>
+          <el-form-item label="Machine">
+            <el-input v-model="suspectDetail.machinename" readonly />
+          </el-form-item>
+          <el-form-item label="Operation">
+            <el-input v-model="suspectDetail.operation" readonly />
+          </el-form-item>
+          <el-form-item label="Recipe">
+            <el-input v-model="suspectDetail.recipe" readonly />
+          </el-form-item>
+          <el-form-item label="Stage">
+            <el-input v-model="suspectDetail.stage" readonly />
+          </el-form-item>
+          <el-form-item label="Process Time">
+            <el-input v-model="suspectDetail.trackouttime" readonly />
+          </el-form-item>
+          <el-form-item label="HL Module">
+            <el-select v-model="suspectDetail.informedModule" filterable clearable>
+              <el-option v-for="module in moduleOptions" :key="module" :label="module" :value="module" />
+            </el-select>
+          </el-form-item>
+        </el-form>
+      </div>
+    </section>
+  </div>
+</template>
+
+<script setup>
+import { computed, defineComponent, h, reactive, ref } from "vue";
+import { ElMessage } from "element-plus";
+import { Aim, Connection, Download, Refresh, Search } from "@element-plus/icons-vue";
+
+/*
+Egg.js adapter endpoints expected by this SFC:
+GET /api/ye-defect-notice/lots/basic-info
+GET /api/ye-defect-notice/dns/options
+GET /api/ye-defect-notice/dns/:dnId
+GET /api/ye-defect-notice/wafers/defect-result
+GET /api/ye-defect-notice/dns/similar
+GET /api/ye-defect-notice/suspect-steps
+GET /api/ye-defect-notice/suspect-steps/detail
+*/
+const API_BASE = "/api/ye-defect-notice";
+
+const queryMode = ref("new");
+const historyScope = ref("beforeScan");
+const visualTab = ref("map");
+
+const loading = reactive({
+  lot: false,
+  defect: false,
+  similar: false,
+  suspect: false,
+});
+
+const form = reactive({
+  lotId: "",
+  dnNo: "",
+  scanStepKey: "",
+  defectCode: "",
+  dnWafer: "",
+  preScanStepKey: "",
+  addScanWafer: "",
+  suspectStepKey: "",
+  similarRange: defaultSimilarRange(),
+});
+
+const lotBasic = reactive({});
+const selectedScanStep = reactive(emptyStep());
+const suspectDetail = reactive(emptyStep());
+
+const dnOptions = ref([]);
+const lotHistory = ref([]);
+const scanStepOptions = ref([]);
+const suspectStepOptions = ref([]);
+const defectCodeOptions = ref([]);
+const waferOptions = ref([]);
+const similarDns = ref([]);
+const moduleOptions = ref([]);
+
+const defectResult = reactive({
+  dn: emptyDefectResult(),
+  pre: emptyDefectResult(),
+  add: emptyDefectResult(),
+  activeMode: "dn",
+});
+
+const historyScopeOptions = [
+  { label: "Before Scan", value: "beforeScan" },
+  { label: "All History", value: "all" },
+];
+
+const canSearchSimilar = computed(() => {
+  return Boolean(selectedScanStep.stage && form.defectCode && form.similarRange?.length === 2);
+});
+
+const defectModeLabel = computed(() => {
+  const map = { dn: "DN Wafer", pre: "Pre Scan", add: "Add Scan" };
+  return map[defectResult.activeMode] || "DN Wafer";
+});
+
+const activeVisual = computed(() => defectResult[defectResult.activeMode] || emptyDefectResult());
+
+const defectMetrics = computed(() => {
+  const summary = activeVisual.value.summary || {};
+  return [
+    { label: "TC", value: valueOrDash(summary.TC ?? summary.tc) },
+    { label: "RDC", value: valueOrDash(summary.RDC ?? summary.rdc) },
+    { label: "DC", value: valueOrDash(summary.DC ?? summary.dc) },
+    { label: "AC", value: valueOrDash(summary.AC ?? summary.ac) },
+    { label: "NDD %", value: valueOrDash(summary.nddPercent ?? toPercent(summary.NDD ?? summary.ndd)) },
+    { label: "NDD New %", value: valueOrDash(summary.nddNewPercent ?? toPercent(summary.NDD_NEW ?? summary.nddNew)) },
+    { label: "NDC", value: valueOrDash(summary.NDC ?? summary.ndc ?? calcNdc(summary)) },
+  ];
+});
+
+const preScanOptions = computed(() => {
+  const scanIndex = lotHistory.value.findIndex((item) => item.historyKey === form.scanStepKey);
+  if (scanIndex < 0) return scanStepOptions.value;
+  return lotHistory.value
+    .slice(scanIndex + 1)
+    .map((item) => ({ key: item.historyKey, label: formatStepLabel(item), raw: item }));
+});
+
+const visibleLotHistory = computed(() => {
+  if (historyScope.value === "all" || !selectedScanStep.historyKey) return lotHistory.value;
+  const scanTime = normalizeTime(selectedScanStep.trackouttime);
+  return lotHistory.value.filter((item) => {
+    const itemTime = normalizeTime(item.trackouttime);
+    return itemTime && scanTime ? itemTime <= scanTime : true;
+  });
+});
+
+async function handleGetDnInfo() {
+  loading.lot = true;
+  try {
+    if (queryMode.value === "new") {
+      await getLotBasicInfo();
+    } else {
+      await getExistDnInfo();
+    }
+  } catch (error) {
+    showApiError(error, "Lot/DN 信息获取失败");
+  } finally {
+    loading.lot = false;
+  }
+}
+
+async function getLotBasicInfo() {
+  if (!form.lotId) {
+    ElMessage.warning("请输入 Lot ID");
+    return;
+  }
+
+  const payload = await apiGet("/lots/basic-info", { lotId: form.lotId });
+  setObject(lotBasic, payload.basicInfo || {});
+  form.dnNo = payload.dnId || "";
+  lotHistory.value = normalizeHistory(payload.lotHistory || []);
+  scanStepOptions.value = normalizeStepOptions(payload.scanSteps, lotHistory.value);
+  defectCodeOptions.value = payload.defectCodes || defectCodeOptions.value;
+  waferOptions.value = payload.waferList || waferOptions.value;
+  moduleOptions.value = payload.modules || moduleOptions.value;
+
+  if (!lotHistory.value.length) {
+    ElMessage.warning("未查询到 Lot History");
+    return;
+  }
+  if (scanStepOptions.value.length === 1) {
+    form.scanStepKey = scanStepOptions.value[0].key;
+    handleScanStepChange(form.scanStepKey);
+  }
+}
+
+async function getExistDnInfo() {
+  if (!form.dnNo) {
+    ElMessage.warning("请选择 DN No");
+    return;
+  }
+
+  const payload = await apiGet(`/dns/${encodeURIComponent(form.dnNo)}`);
+  setObject(lotBasic, payload.basicInfo || {});
+  form.lotId = payload.lotId || lotBasic.lotname || form.lotId;
+  form.defectCode = payload.defectCode || "";
+  form.scanStepKey = payload.scanStepKey || "";
+  form.dnWafer = payload.dnWafer || "";
+  lotHistory.value = normalizeHistory(payload.lotHistory || []);
+  scanStepOptions.value = normalizeStepOptions(payload.scanSteps, lotHistory.value);
+  defectCodeOptions.value = payload.defectCodes || defectCodeOptions.value;
+  waferOptions.value = payload.waferList || waferOptions.value;
+  moduleOptions.value = payload.modules || moduleOptions.value;
+  handleScanStepChange(form.scanStepKey);
+
+  if (payload.defectResult) {
+    defectResult.dn = normalizeDefectResult(payload.defectResult);
+  }
+}
+
+function handleScanStepChange(stepKey) {
+  const option = scanStepOptions.value.find((item) => item.key === stepKey);
+  const step = option?.raw || {};
+  setObject(selectedScanStep, step);
+  defectResult.activeMode = "dn";
+}
+
+async function loadWaferDefect(mode) {
+  const wafer = mode === "add" ? form.addScanWafer : form.dnWafer;
+  const scanStep = mode === "pre" ? findHistoryByKey(form.preScanStepKey) : selectedScanStep;
+
+  if (!form.lotId || !wafer || !form.defectCode || !scanStep.recipe) {
+    ElMessage.warning("Lot、Wafer、Defect Type 和 Scan Step 必须完整");
+    return;
+  }
+
+  loading.defect = true;
+  try {
+    const payload = await apiGet("/wafers/defect-result", {
+      lotId: form.lotId,
+      waferId: wafer.replace(/^#/, ""),
+      defectCode: lastSegment(form.defectCode),
+      recipe: scanStep.recipe,
+      stepSeq: scanStep.stepseq,
+      stage: scanStep.stage,
+      tool: scanStep.machinename,
+      trackOutTime: scanStep.trackouttime,
+      source: mode,
+      oqa: String(scanStep.recipe || "").startsWith("AVI"),
+    });
+
+    defectResult[mode] = normalizeDefectResult(payload);
+    defectResult.activeMode = mode;
+    visualTab.value = "map";
+  } catch (error) {
+    showApiError(error, "Defect 信息获取失败");
+  } finally {
+    loading.defect = false;
+  }
+}
+
+async function handleSimilarSearch() {
+  if (!canSearchSimilar.value) {
+    ElMessage.warning("请选择 Scan Step、Defect Type 和时间范围");
+    return;
+  }
+
+  loading.similar = true;
+  try {
+    const [startTime, endTime] = form.similarRange;
+    const payload = await apiGet("/dns/similar", {
+      tech: lotBasic.techg || "",
+      stage: selectedScanStep.stage,
+      defect: form.defectCode,
+      startTime,
+      endTime,
+      excludeDnId: form.dnNo,
+    });
+    similarDns.value = payload.items || [];
+  } catch (error) {
+    showApiError(error, "相似 DN 查询失败");
+  } finally {
+    loading.similar = false;
+  }
+}
+
+async function loadSuspectSteps() {
+  if (!form.lotId) return;
+
+  loading.suspect = true;
+  try {
+    const payload = await apiGet("/suspect-steps", {
+      lotId: form.lotId,
+      dnId: form.dnNo,
+      waferId: form.dnWafer,
+    });
+
+    const source = payload.items?.length ? payload.items : lotHistory.value;
+    suspectStepOptions.value = source.map((item) => ({
+      key: item.suspectKey || `${item.stepseq || ""}__${item.trackouttime || ""}__${item.stepdesc || "Null"}`,
+      label: item.label || `${item.stepseq || ""}__${item.trackouttime || ""}__${item.stepdesc || "Null"}`,
+      raw: item,
+    }));
+    moduleOptions.value = payload.modules || moduleOptions.value;
+  } catch (error) {
+    showApiError(error, "Suspect Step 获取失败");
+  } finally {
+    loading.suspect = false;
+  }
+}
+
+async function handleSuspectStepChange(stepKey) {
+  const option = suspectStepOptions.value.find((item) => item.key === stepKey);
+  if (!option) {
+    setObject(suspectDetail, emptyStep());
+    return;
+  }
+
+  setObject(suspectDetail, {
+    ...option.raw,
+    informedModule: option.raw.informedModule || guessModule(option.raw),
+  });
+
+  try {
+    const payload = await apiGet("/suspect-steps/detail", {
+      dnId: form.dnNo,
+      lotId: option.raw.lotname || form.lotId,
+      stepSeq: option.raw.stepseq,
+      trackOutTime: option.raw.trackouttime,
+      stepDesc: option.raw.stepdesc,
+    });
+    setObject(suspectDetail, {
+      ...suspectDetail,
+      ...payload.detail,
+      informedModule: payload.detail?.informedModule || suspectDetail.informedModule,
+    });
+    moduleOptions.value = payload.modules || moduleOptions.value;
+
+    if (payload.warning) {
+      ElMessage.warning(payload.warning);
+    }
+  } catch (error) {
+    showApiError(error, "Suspect Step 明细获取失败");
+  }
+}
+
+async function loadDnOptions(keyword) {
+  const payload = await apiGet("/dns/options", { keyword, lotId: form.lotId });
+  dnOptions.value = (payload.items || []).map((item) => ({
+    ...item,
+    label: item.label || `${item.dnId} ${item.dnClass || ""} ${item.lotId || ""} ${item.defectCode || ""}`,
+  }));
+}
+
+function lotHistoryRowClass({ row }) {
+  if (row.historyKey === selectedScanStep.historyKey) return "scan-step-row";
+  if (row.historyKey === suspectDetail.historyKey) return "suspect-step-row";
+  return "";
+}
+
+async function apiGet(path, params = {}) {
+  const url = new URL(`${API_BASE}${path}`, window.location.origin);
+  Object.entries(params).forEach(([key, value]) => {
+    if (value !== undefined && value !== null && value !== "") url.searchParams.set(key, value);
+  });
+
+  const response = await fetch(url.toString(), {
+    headers: { Accept: "application/json" },
+    credentials: "include",
+  });
+
+  if (!response.ok) {
+    throw new Error(`${response.status} ${response.statusText}`);
+  }
+
+  const body = await response.json();
+  if (body.success === false) throw new Error(body.message || "API failed");
+  return body.data ?? body;
+}
+
+function normalizeHistory(rows) {
+  return rows.map((row, index) => ({
+    ...row,
+    historyKey: row.historyKey || `${row.stepseq || row.stepsequence || ""}_${row.trackouttime || ""}_${index}`,
+    stepseq: row.stepseq || row.stepsequence || "",
+    machinename: row.machinename || row.machine || "",
+    productspecname: row.productspecname || row.product || "",
+  }));
+}
+
+function buildScanStepOptions(rows) {
+  return rows
+    .filter((row) => /^(BIYOCAP|BYY|SRC)/i.test(row.operation || ""))
+    .sort((a, b) => String(b.trackouttime || "").localeCompare(String(a.trackouttime || "")))
+    .map((row) => ({ key: row.historyKey, label: formatStepLabel(row), raw: row }));
+}
+
+function normalizeStepOptions(serverOptions, rows) {
+  if (!Array.isArray(serverOptions) || !serverOptions.length) return buildScanStepOptions(rows);
+  const rowByKey = new Map(rows.map((row) => [row.historyKey, row]));
+  return serverOptions.map((item) => ({
+    key: item.key,
+    label: item.label || formatStepLabel(item.raw || rowByKey.get(item.key) || {}),
+    raw: item.raw || rowByKey.get(item.key) || {},
+  }));
+}
+
+function normalizeDefectResult(payload) {
+  return {
+    summary: payload.summary || payload.defectInfo || {},
+    dies: payload.dies || payload.dieCoordinates || [],
+    defects: payload.defects || payload.defectCoordinates || [],
+    trend: payload.trend || [],
+    pareto: payload.pareto || [],
+    images: payload.images || [],
+    ng: Boolean(payload.ng),
+  };
+}
+
+function emptyStep() {
+  return {
+    historyKey: "",
+    stepseq: "",
+    stage: "",
+    operation: "",
+    stepdesc: "",
+    machinename: "",
+    recipe: "",
+    trackintime: "",
+    trackouttime: "",
+    informedModule: "",
+  };
+}
+
+function emptyDefectResult() {
+  return {
+    summary: {},
+    dies: [],
+    defects: [],
+    trend: [],
+    pareto: [],
+    images: [],
+    ng: false,
+  };
+}
+
+function setObject(target, source) {
+  Object.keys(target).forEach((key) => delete target[key]);
+  Object.assign(target, source || {});
+}
+
+function findHistoryByKey(key) {
+  return lotHistory.value.find((item) => item.historyKey === key) || {};
+}
+
+function formatStepLabel(row) {
+  return `${row.stepseq || ""}_${row.trackouttime || ""}_${row.stage || ""}`;
+}
+
+function normalizeTime(value) {
+  if (!value) return 0;
+  const timestamp = new Date(String(value).replace(/-/g, "/")).getTime();
+  return Number.isNaN(timestamp) ? 0 : timestamp;
+}
+
+function lastSegment(value) {
+  return String(value || "").split("_").filter(Boolean).pop() || "";
+}
+
+function valueOrDash(value) {
+  return value === undefined || value === null || value === "" ? "-" : value;
+}
+
+function toPercent(value) {
+  if (value === undefined || value === null || value === "") return "-";
+  const number = Number(value);
+  return Number.isFinite(number) ? (number * 100).toFixed(2) : "-";
+}
+
+function calcNdc(summary) {
+  const dc = Number(summary.DC ?? summary.dc);
+  const ac = Number(summary.AC ?? summary.ac);
+  const rdc = Number(summary.RDC ?? summary.rdc);
+  if (!Number.isFinite(dc) || !Number.isFinite(ac) || !Number.isFinite(rdc)) return "";
+  if (ac >= rdc) return rdc === 0 ? "" : Math.round((dc * ac) / rdc);
+  return dc;
+}
+
+function guessModule(step) {
+  const capability = `${step.oldmachinecapability || ""} ${step.operation || ""}`.toUpperCase();
+  if (capability.includes("L-ADI") || capability.includes("L-AEI")) return "Litho";
+  if (capability.includes("ETCH")) return "Etch";
+  if (capability.includes("CMP")) return "CMP";
+  if (capability.includes("CVD") || capability.includes("PVD")) return "ThinFilm";
+  return "";
+}
+
+function defaultSimilarRange() {
+  const end = new Date();
+  const start = new Date();
+  start.setDate(end.getDate() - 90);
+  return [formatDate(start), formatDate(end)];
+}
+
+function formatDate(date) {
+  const y = date.getFullYear();
+  const m = String(date.getMonth() + 1).padStart(2, "0");
+  const d = String(date.getDate()).padStart(2, "0");
+  return `${y}-${m}-${d}`;
+}
+
+function showApiError(error, fallback) {
+  ElMessage.error(`${fallback}: ${error.message || error}`);
+}
+
+const WaferMapSvg = defineComponent({
+  name: "WaferMapSvg",
+  props: {
+    dies: { type: Array, default: () => [] },
+    defects: { type: Array, default: () => [] },
+    ng: { type: Boolean, default: false },
+  },
+  setup(props) {
+    const bounds = computed(() => {
+      const xs = props.dies.map((item) => Number(item.index_x ?? item.x)).filter(Number.isFinite);
+      const ys = props.dies.map((item) => Number(item.index_y ?? item.y)).filter(Number.isFinite);
+      return {
+        minX: Math.min(...xs, 0),
+        maxX: Math.max(...xs, 1),
+        minY: Math.min(...ys, 0),
+        maxY: Math.max(...ys, 1),
+      };
+    });
+
+    const project = (x, y) => {
+      const b = bounds.value;
+      const w = Math.max(b.maxX - b.minX + 1, 1);
+      const hgt = Math.max(b.maxY - b.minY + 1, 1);
+      return {
+        x: 20 + ((Number(x) - b.minX) / w) * 320,
+        y: 20 + ((b.maxY - Number(y)) / hgt) * 320,
+        sizeX: Math.max(320 / w - 1, 2),
+        sizeY: Math.max(320 / hgt - 1, 2),
+      };
+    };
+
+    return () =>
+      h("svg", { viewBox: "0 0 360 380", class: "wafer-svg", role: "img" }, [
+        h("rect", { x: 0, y: 0, width: 360, height: 380, rx: 6, fill: props.ng ? "#fff3d4" : "#ffffff" }),
+        h("circle", { cx: 180, cy: 180, r: 168, fill: "#f8fafc", stroke: "#334155", "stroke-width": 2 }),
+        props.dies.map((die) => {
+          const p = project(die.index_x ?? die.x, die.index_y ?? die.y);
+          return h("rect", {
+            x: p.x,
+            y: p.y,
+            width: p.sizeX,
+            height: p.sizeY,
+            fill: "#e2e8f0",
+            stroke: "#94a3b8",
+            "stroke-width": 0.4,
+          });
+        }),
+        props.defects.map((defect) => {
+          const p = project(defect.index_x ?? defect.x ?? defect.die_x, defect.index_y ?? defect.y ?? defect.die_y);
+          return h("circle", {
+            cx: p.x + p.sizeX / 2,
+            cy: p.y + p.sizeY / 2,
+            r: 3,
+            fill: defect.defect_class ? "#ef4444" : "#f97316",
+            opacity: 0.88,
+          });
+        }),
+        h("text", { x: 180, y: 365, "text-anchor": "middle", class: "svg-caption" }, "Wafer Defect Map"),
+      ]);
+  },
+});
+
+const TrendChartSvg = defineComponent({
+  name: "TrendChartSvg",
+  props: { points: { type: Array, default: () => [] } },
+  setup(props) {
+    return () => renderLineChart(props.points, "Defect Trend");
+  },
+});
+
+const ParetoChartSvg = defineComponent({
+  name: "ParetoChartSvg",
+  props: { items: { type: Array, default: () => [] } },
+  setup(props) {
+    return () => {
+      const items = props.items.slice(0, 12);
+      const max = Math.max(...items.map((item) => Number(item.value ?? item.cnt ?? item.count)), 1);
+      return h("svg", { viewBox: "0 0 680 340", class: "chart-svg", role: "img" }, [
+        h("rect", { width: 680, height: 340, rx: 6, fill: "#ffffff" }),
+        h("line", { x1: 46, y1: 286, x2: 640, y2: 286, stroke: "#334155" }),
+        h("line", { x1: 46, y1: 30, x2: 46, y2: 286, stroke: "#334155" }),
+        items.map((item, index) => {
+          const value = Number(item.value ?? item.cnt ?? item.count) || 0;
+          const barWidth = 36;
+          const gap = 12;
+          const x = 62 + index * (barWidth + gap);
+          const height = (value / max) * 220;
+          return h("g", {}, [
+            h("rect", { x, y: 286 - height, width: barWidth, height, fill: "#2563eb", rx: 2 }),
+            h("text", { x: x + barWidth / 2, y: 280 - height, "text-anchor": "middle", class: "svg-value" }, value),
+            h("text", { x: x + barWidth / 2, y: 306, "text-anchor": "end", transform: `rotate(-45 ${x + barWidth / 2} 306)`, class: "svg-label" }, item.name || item.label || item.defect_class || index + 1),
+          ]);
+        }),
+        h("text", { x: 340, y: 22, "text-anchor": "middle", class: "svg-caption" }, "Defect Pareto"),
+      ]);
+    };
+  },
+});
+
+function renderLineChart(points, title) {
+  const items = points.slice(-100);
+  const values = items.map((item) => Number(item.value ?? item.tc ?? item.dc ?? item.ndc)).filter(Number.isFinite);
+  const max = Math.max(...values, 1);
+  const min = Math.min(...values, 0);
+  const span = Math.max(max - min, 1);
+  const coords = items.map((item, index) => {
+    const value = Number(item.value ?? item.tc ?? item.dc ?? item.ndc) || 0;
+    const x = 50 + (index / Math.max(items.length - 1, 1)) * 590;
+    const y = 286 - ((value - min) / span) * 230;
+    return { x, y, value, key: item.key || `${item.lot_id || ""}#${item.wafer_id || ""}` };
+  });
+  const path = coords.map((point, index) => `${index ? "L" : "M"} ${point.x} ${point.y}`).join(" ");
+
+  return h("svg", { viewBox: "0 0 680 340", class: "chart-svg", role: "img" }, [
+    h("rect", { width: 680, height: 340, rx: 6, fill: "#ffffff" }),
+    h("line", { x1: 46, y1: 286, x2: 640, y2: 286, stroke: "#334155" }),
+    h("line", { x1: 46, y1: 30, x2: 46, y2: 286, stroke: "#334155" }),
+    h("path", { d: path, fill: "none", stroke: "#0f766e", "stroke-width": 2.5 }),
+    coords.map((point) =>
+      h("circle", {
+        cx: point.x,
+        cy: point.y,
+        r: 4,
+        fill: point.key && point.key.includes("#") ? "#dc2626" : "#0f766e",
+      }),
+    ),
+    h("text", { x: 340, y: 22, "text-anchor": "middle", class: "svg-caption" }, title),
+  ]);
+}
+</script>
+
+<style scoped>
+.dn-page {
+  min-height: 100vh;
+  padding: 16px;
+  color: #1f2937;
+  background: #f5f7fb;
+}
+
+.toolbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid #d8dee9;
+  border-radius: 6px;
+  background: #ffffff;
+}
+
+.lot-input {
+  width: 220px;
+}
+
+.dn-select {
+  width: 360px;
+}
+
+.summary-band,
+.panel {
+  margin-top: 12px;
+  border: 1px solid #d8dee9;
+  border-radius: 6px;
+  background: #ffffff;
+}
+
+.summary-band {
+  padding: 12px;
+}
+
+.work-grid {
+  display: grid;
+  grid-template-columns: repeat(24, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.span-8 {
+  grid-column: span 8;
+}
+
+.span-10 {
+  grid-column: span 10;
+}
+
+.span-14 {
+  grid-column: span 14;
+}
+
+.span-16 {
+  grid-column: span 16;
+}
+
+.panel {
+  min-width: 0;
+  padding: 12px;
+}
+
+.panel-head {
+  display: flex;
+  min-height: 32px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+
+.panel-head h2 {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 650;
+}
+
+.compact-tabs {
+  width: 330px;
+}
+
+.metric-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.metric {
+  min-height: 58px;
+  padding: 8px;
+  border: 1px solid #d8dee9;
+  border-radius: 6px;
+  background: #f8fafc;
+}
+
+.metric span {
+  display: block;
+  color: #64748b;
+  font-size: 12px;
+}
+
+.metric strong {
+  display: block;
+  margin-top: 6px;
+  font-size: 20px;
+  line-height: 1;
+}
+
+.visual-panel {
+  min-height: 438px;
+}
+
+.visual-body {
+  display: grid;
+  min-height: 360px;
+  place-items: center;
+  border: 1px solid #e5e7eb;
+  border-radius: 6px;
+  background: #f8fafc;
+}
+
+.wafer-svg {
+  width: min(100%, 420px);
+  height: 360px;
+}
+
+.chart-svg {
+  width: 100%;
+  max-height: 360px;
+}
+
+.svg-caption {
+  fill: #1f2937;
+  font-size: 14px;
+  font-weight: 650;
+}
+
+.svg-label {
+  fill: #475569;
+  font-size: 10px;
+}
+
+.svg-value {
+  fill: #1f2937;
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.image-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+  min-height: 360px;
+}
+
+.image-grid .el-image,
+.image-empty {
+  width: 100%;
+  height: 170px;
+  border: 1px solid #e5e7eb;
+  border-radius: 6px;
+  background: #f8fafc;
+}
+
+.image-empty {
+  display: grid;
+  place-items: center;
+  color: #64748b;
+  font-size: 13px;
+}
+
+.suspect-form {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  column-gap: 10px;
+}
+
+.suspect-form :deep(.el-form-item:first-child) {
+  grid-column: 1 / -1;
+}
+
+:deep(.scan-step-row) {
+  --el-table-tr-bg-color: #ecfdf5;
+}
+
+:deep(.suspect-step-row) {
+  --el-table-tr-bg-color: #fff7ed;
+}
+
+@media (max-width: 1180px) {
+  .span-8,
+  .span-10,
+  .span-14,
+  .span-16 {
+    grid-column: 1 / -1;
+  }
+
+  .toolbar {
+    flex-wrap: wrap;
+  }
+
+  .dn-select,
+  .lot-input {
+    width: min(100%, 320px);
+  }
+}
+
+@media (max-width: 720px) {
+  .dn-page {
+    padding: 10px;
+  }
+
+  .metric-grid,
+  .image-grid,
+  .suspect-form {
+    grid-template-columns: 1fr;
+  }
+
+  .compact-tabs {
+    width: 100%;
+  }
+}
+</style>
+
